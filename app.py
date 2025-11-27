@@ -44,40 +44,7 @@ def build_location_entries(values):
         entries.append({"value": val, "tokens": tokens})
     return entries
 
-try:
-    with open('centers.json', 'r') as f:
-        data = json.load(f)
-    df = pd.DataFrame(data['centers'])
-    if not df.empty:
-        df['norm_nombre'] = df['nombre'].apply(lambda x: normalize_text(x))
-        df['norm_poblacion'] = df['poblacion'].apply(lambda x: normalize_text(x))
-        df['norm_provincia'] = df['provincia'].apply(lambda x: normalize_text(x))
-        location_index["city"] = build_location_entries(df['norm_poblacion'].dropna().unique())
-        location_index["province"] = build_location_entries(df['norm_provincia'].dropna().unique())
-    logger.info("Data loaded successfully. %d centers found.", len(df))
-except Exception as e:
-    logger.error(f"Error loading data: {e}")
-    df = pd.DataFrame()
-
-def detect_location_candidates(query_tokens, query_string, entries):
-    hints = set()
-    if not entries or not query_tokens:
-        return hints
-    for entry in entries:
-        tokens = entry['tokens']
-        if not tokens:
-            continue
-        overlap = len(tokens & query_tokens)
-        token_ratio = overlap / len(tokens) if tokens else 0
-        if overlap == len(tokens) or (len(tokens) > 1 and token_ratio >= 0.6) or (len(tokens) == 1 and overlap == 1):
-            hints.add(entry['value'])
-            continue
-        if overlap >= 1 and token_ratio >= 0.4:
-            hints.add(entry['value'])
-            continue
-        if fuzzy_similarity(query_string, entry['value']) >= 0.88:
-            hints.add(entry['value'])
-    return hints
+df = pd.DataFrame()
 
 def normalize_text(text):
     if not isinstance(text, str):
@@ -143,6 +110,63 @@ def fuzzy_similarity(str1, str2):
     """Calculate similarity ratio between two strings (0.0 to 1.0)"""
     return SequenceMatcher(None, str1, str2).ratio()
 
+
+def detect_location_candidates(query_tokens, query_string, entries):
+    hints = set()
+    if not entries or not query_tokens:
+        return hints
+    for entry in entries:
+        tokens = entry['tokens']
+        if not tokens:
+            continue
+        overlap = len(tokens & query_tokens)
+        token_ratio = overlap / len(tokens) if tokens else 0
+        if overlap == len(tokens) or (len(tokens) > 1 and token_ratio >= 0.6) or (len(tokens) == 1 and overlap == 1):
+            hints.add(entry['value'])
+            continue
+        if overlap >= 1 and token_ratio >= 0.4:
+            hints.add(entry['value'])
+            continue
+        if fuzzy_similarity(query_string, entry['value']) >= 0.88:
+            hints.add(entry['value'])
+    return hints
+
+
+DATA_FILE = os.path.join(os.path.dirname(__file__), "centers.json")
+
+
+def load_data():
+    global df, location_index
+    try:
+        with open(DATA_FILE, 'r') as f:
+            data = json.load(f)
+        df_local = pd.DataFrame(data.get('centers', []))
+        if df_local.empty:
+            df = df_local
+            location_index["city"] = []
+            location_index["province"] = []
+            logger.warning("Centers dataset is empty.")
+            return
+        df_local['norm_nombre'] = df_local['nombre'].apply(lambda x: normalize_text(x))
+        df_local['norm_poblacion'] = df_local['poblacion'].apply(lambda x: normalize_text(x))
+        df_local['norm_provincia'] = df_local['provincia'].apply(lambda x: normalize_text(x))
+        if 'direccion' in df_local.columns:
+            df_local['norm_direccion'] = df_local['direccion'].apply(lambda x: normalize_text(x))
+        else:
+            df_local['norm_direccion'] = ""
+        df = df_local
+        location_index["city"] = build_location_entries(df['norm_poblacion'].dropna().unique())
+        location_index["province"] = build_location_entries(df['norm_provincia'].dropna().unique())
+        logger.info("Data loaded successfully. %d centers found.", len(df))
+    except Exception as e:
+        logger.error(f"Error loading data: {e}")
+        df = pd.DataFrame()
+        location_index["city"] = []
+        location_index["province"] = []
+
+
+load_data()
+
 @app.route('/api/chat', methods=['POST'])
 def chat():
     user_message = request.json.get('message', '').lower()
@@ -172,6 +196,10 @@ def chat():
         df['norm_nombre'] = df['nombre'].apply(normalize_text)
         df['norm_poblacion'] = df['poblacion'].apply(normalize_text)
         df['norm_provincia'] = df['provincia'].apply(normalize_text)
+        if 'direccion' in df.columns:
+            df['norm_direccion'] = df['direccion'].apply(normalize_text)
+        else:
+            df['norm_direccion'] = ""
         location_index["city"] = build_location_entries(df['norm_poblacion'].dropna().unique())
         location_index["province"] = build_location_entries(df['norm_provincia'].dropna().unique())
 
@@ -191,10 +219,7 @@ def chat():
     # Pre-calculate phonetic codes for query tokens
     query_phonetics = {qt: jellyfish.metaphone(qt) for qt in query_tokens if len(qt) > 2}
     
-    results = []
-    row_data_cache = []
     for _, row in df.iterrows():
-        row_data_cache.append(row)
         if filter_by_city and row['norm_poblacion'] not in detected_city_hints:
             continue
         if filter_by_province and row['norm_provincia'] not in detected_province_hints:
@@ -223,16 +248,20 @@ def chat():
         row_nombre_tokens = set([w for w in row['norm_nombre'].split() if w not in STOPWORDS])
         row_poblacion_tokens = set([w for w in row['norm_poblacion'].split() if w not in STOPWORDS])
         row_provincia_tokens = set([w for w in row['norm_provincia'].split() if w not in STOPWORDS])
+        row_direccion_tokens = set([w for w in row.get('norm_direccion', '').split() if w not in STOPWORDS])
         
         # Fallback to original tokens if filtering removed everything
         if not row_nombre_tokens: row_nombre_tokens = set(row['norm_nombre'].split())
         if not row_poblacion_tokens: row_poblacion_tokens = set(row['norm_poblacion'].split())
         if not row_provincia_tokens: row_provincia_tokens = set(row['norm_provincia'].split())
+        if not row_direccion_tokens and row.get('norm_direccion'):
+            row_direccion_tokens = set(row['norm_direccion'].split())
         
         # Check for any token overlap
         nombre_overlap = len(query_tokens & row_nombre_tokens)
         poblacion_overlap = len(query_tokens & row_poblacion_tokens)
         provincia_overlap = len(query_tokens & row_provincia_tokens)
+        direccion_overlap = len(query_tokens & row_direccion_tokens)
         # Token-level fuzzy matches to catch close spellings (e.g., "sardinia" vs "sardenya")
         def token_fuzzy_match(target_tokens):
             for qt in query_tokens:
@@ -247,16 +276,19 @@ def chat():
         nombre_token_fuzzy = token_fuzzy_match(row_nombre_tokens)
         poblacion_token_fuzzy = token_fuzzy_match(row_poblacion_tokens)
         provincia_token_fuzzy = token_fuzzy_match(row_provincia_tokens)
+        direccion_token_fuzzy = token_fuzzy_match(row_direccion_tokens)
         
         # Phonetic matching
         # Check if query phonetics match row phonetics
         row_nombre_phonetics = {w: jellyfish.metaphone(w) for w in row_nombre_tokens if len(w) > 2}
         row_poblacion_phonetics = {w: jellyfish.metaphone(w) for w in row_poblacion_tokens if len(w) > 2}
         row_provincia_phonetics = {w: jellyfish.metaphone(w) for w in row_provincia_tokens if len(w) > 2}
+        row_direccion_phonetics = {w: jellyfish.metaphone(w) for w in row_direccion_tokens if len(w) > 2}
         
         nombre_phonetic_match = any(qp in row_nombre_phonetics.values() for qp in query_phonetics.values())
         poblacion_phonetic_match = any(qp in row_poblacion_phonetics.values() for qp in query_phonetics.values())
         provincia_phonetic_match = any(qp in row_provincia_phonetics.values() for qp in query_phonetics.values())
+        direccion_phonetic_match = any(qp in row_direccion_phonetics.values() for qp in query_phonetics.values())
         
         # Also check for substring matches (e.g., "sebastian" in "san sebastian")
         nombre_substring_match = any(
@@ -271,19 +303,24 @@ def chat():
             qt in row['norm_provincia'] or row['norm_provincia'] in qt 
             for qt in query_tokens if len(qt) > 3
         )
+        direccion_substring_match = any(
+            qt in row.get('norm_direccion', '') or row.get('norm_direccion', '') in qt 
+            for qt in query_tokens if len(qt) > 3
+        )
         
         # Pre-calculate fuzzy scores for guard and reuse later
         nombre_fuzzy_full = fuzzy_similarity(query_string, row['norm_nombre'])
         poblacion_fuzzy_full = fuzzy_similarity(query_string, row['norm_poblacion'])
         provincia_fuzzy_full = fuzzy_similarity(query_string, row['norm_provincia'])
-        fuzzy_override_match = max(nombre_fuzzy_full, poblacion_fuzzy_full, provincia_fuzzy_full) >= 0.7
+        direccion_fuzzy_full = fuzzy_similarity(query_string, row.get('norm_direccion', ''))
+        fuzzy_override_match = max(nombre_fuzzy_full, poblacion_fuzzy_full, provincia_fuzzy_full, direccion_fuzzy_full) >= 0.7
         
         # Skip if there's no overlap, phonetic match, substring match, token fuzzy, or strong fuzzy match
         if (not fuzzy_override_match and
-            nombre_overlap == 0 and poblacion_overlap == 0 and provincia_overlap == 0 and
-            not nombre_phonetic_match and not poblacion_phonetic_match and not provincia_phonetic_match and
-            not nombre_substring_match and not poblacion_substring_match and not provincia_substring_match and
-            not nombre_token_fuzzy and not poblacion_token_fuzzy and not provincia_token_fuzzy):
+            nombre_overlap == 0 and poblacion_overlap == 0 and provincia_overlap == 0 and direccion_overlap == 0 and
+            not nombre_phonetic_match and not poblacion_phonetic_match and not provincia_phonetic_match and not direccion_phonetic_match and
+            not nombre_substring_match and not poblacion_substring_match and not provincia_substring_match and not direccion_substring_match and
+            not nombre_token_fuzzy and not poblacion_token_fuzzy and not provincia_token_fuzzy and not direccion_token_fuzzy):
             continue
         
         # Calculate fuzzy similarity for fields with some overlap
@@ -291,39 +328,44 @@ def chat():
         nombre_fuzzy = nombre_fuzzy_full if (nombre_overlap > 0 or nombre_phonetic_match or nombre_substring_match or fuzzy_override_match) else 0
         poblacion_fuzzy = poblacion_fuzzy_full if (poblacion_overlap > 0 or poblacion_phonetic_match or poblacion_substring_match or fuzzy_override_match) else 0
         provincia_fuzzy = provincia_fuzzy_full if (provincia_overlap > 0 or provincia_phonetic_match or provincia_substring_match or fuzzy_override_match) else 0
+        direccion_fuzzy = direccion_fuzzy_full if (direccion_overlap > 0 or direccion_phonetic_match or direccion_substring_match or direccion_token_fuzzy or fuzzy_override_match) else 0
         
         # Normalized overlap scores - use Jaccard-like ratio but favor query coverage
         nombre_overlap_score = (nombre_overlap / len(row_nombre_tokens)) if row_nombre_tokens else 0
         poblacion_overlap_score = (poblacion_overlap / len(row_poblacion_tokens)) if row_poblacion_tokens else 0
         provincia_overlap_score = (provincia_overlap / len(row_provincia_tokens)) if row_provincia_tokens else 0
+        direccion_overlap_score = (direccion_overlap / len(row_direccion_tokens)) if row_direccion_tokens else 0
         nombre_overlap_score = min(nombre_overlap_score, 1.0)
         poblacion_overlap_score = min(poblacion_overlap_score, 1.0)
         provincia_overlap_score = min(provincia_overlap_score, 1.0)
+        direccion_overlap_score = min(direccion_overlap_score, 1.0)
         
         # Boost for phonetic or token-level fuzzy matches
         if nombre_phonetic_match or nombre_token_fuzzy: nombre_overlap_score = max(nombre_overlap_score, 0.6)
         if poblacion_phonetic_match or poblacion_token_fuzzy: poblacion_overlap_score = max(poblacion_overlap_score, 0.6)
         if provincia_phonetic_match or provincia_token_fuzzy: provincia_overlap_score = max(provincia_overlap_score, 0.6)
+        if direccion_phonetic_match or direccion_token_fuzzy: direccion_overlap_score = max(direccion_overlap_score, 0.6)
 
         # Hybrid score: combine fuzzy and overlap, with overlap being more important
         nombre_score = (nombre_fuzzy * 0.3) + (nombre_overlap_score * 0.7)
         poblacion_score = (poblacion_fuzzy * 0.3) + (poblacion_overlap_score * 0.7)
         provincia_score = (provincia_fuzzy * 0.3) + (provincia_overlap_score * 0.7)
+        direccion_score = (direccion_fuzzy * 0.4) + (direccion_overlap_score * 0.6)
         
         # Calculate final score based on what matched
         # CRITICAL: If both city AND province have decent matches, give massive boost
-        if poblacion_score > 0.35 and provincia_score > 0.35:
+        if (poblacion_score > 0.35 and provincia_score > 0.35) or (direccion_score > 0.35 and (poblacion_score > 0.3 or provincia_score > 0.3)):
             # Both location fields match - this is very likely the right center
             # But if nombre also has a good match, prioritize it
-            if nombre_score > 0.5:
+            if nombre_score > 0.5 or direccion_score > 0.5:
                 # Strong name match with location match - highest priority
-                final_score = (poblacion_score + provincia_score + nombre_score * 2) / 2
+                final_score = (poblacion_score + provincia_score + direccion_score + nombre_score * 2) / 2.5
             else:
                 # Location match without strong name match
-                final_score = (poblacion_score + provincia_score) * 1.2
-        elif nombre_score > 0.5:
+                final_score = (poblacion_score + provincia_score + direccion_score) * 1.1
+        elif nombre_score > 0.5 or direccion_score > 0.5:
             # Strong name match alone
-            final_score = nombre_score * 0.9
+            final_score = max(nombre_score, direccion_score) * 0.95
         elif poblacion_score > 0.5 or provincia_score > 0.5:
             # Strong location match
             final_score = max(poblacion_score, provincia_score) * 0.8
@@ -333,7 +375,8 @@ def chat():
                 nombre_score * 0.7,
                 poblacion_score * 0.8,
                 provincia_score * 0.7,
-                (poblacion_score + provincia_score) / 2 * 0.85
+                direccion_score * 0.7,
+                (poblacion_score + provincia_score + direccion_score) / 3 * 0.85
             )
         
         # Only collect matches with meaningful scores
@@ -342,7 +385,7 @@ def chat():
             matches.append({
                 'row': row,
                 'score': final_score,
-                'location_score': max(poblacion_score, provincia_score),
+                'location_score': max(poblacion_score, provincia_score, direccion_score),
                 'nombre_score': nombre_score
             })
             continue
@@ -351,7 +394,7 @@ def chat():
             row['norm_nombre'],
             row['norm_poblacion'],
             row['norm_provincia'],
-            row.get('direccion', '')
+            row.get('norm_direccion', '')
         ]
         combined_text = " ".join([cf for cf in combined_fields if isinstance(cf, str)])
         combined_similarity = fuzzy_similarity(normalized_query, combined_text)
@@ -359,7 +402,7 @@ def chat():
             matches.append({
                 'row': row,
                 'score': combined_similarity * 0.7,
-                'location_score': max(poblacion_score, provincia_score, combined_similarity),
+                'location_score': max(poblacion_score, provincia_score, direccion_score, combined_similarity),
                 'nombre_score': max(nombre_score, combined_similarity)
             })
     
