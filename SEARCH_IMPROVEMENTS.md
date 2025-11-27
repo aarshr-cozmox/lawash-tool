@@ -23,6 +23,13 @@
 
 **Why**: The scoring algorithm gives equal weight to all Barcelona centers since Barcelona is such a strong location signal.
 
+### 4. ID vs Code Confusion
+**Issue**: The search logic was mixing `id_centro` and `codigo`, causing confusion when a user explicitly asked for one but got results for the other (or both were displayed confusingly).
+
+**Fix Applied**: 
+- Implemented strict matching: if "id" is in the query, prioritize `id_centro` matches. If "code" is in the query, prioritize `codigo` matches.
+- Updated response generation to only show the requested field (ID or Code) when explicitly asked.
+
 ## Recommendations for Further Improvement
 
 ### 1. Boost Address Matches

@@ -245,16 +245,35 @@ def chat():
         row_code_clean = clean_token(row_code)
         # 1. Direct Code/ID Match (Highest Priority)
         # Check if any query token exactly matches id_centro or codigo (case-insensitive)
-        if (row_id in query_tokens or
-            row_code in query_tokens or
-            row_id_clean in query_tokens_clean or
-            row_code_clean in query_tokens_clean or
-            (row_code_clean and row_code_clean in normalized_query_compact)):
+        is_id_match = (row_id in query_tokens or row_id_clean in query_tokens_clean)
+        is_code_match = (row_code in query_tokens or row_code_clean in query_tokens_clean)
+        
+        # Apply strict matching based on user intent
+        if id_requested and is_id_match:
+            # User asked for ID and we found an ID match
             matches.append({
-                'row': row,
-                'score': 1.0,  # Perfect match
-                'location_score': 1.0,
-                'nombre_score': 1.0
+                "row": row,
+                "score": 1.0,
+                "reason": "Direct ID match",
+                "location_score": 1.0
+            })
+            continue
+        elif code_requested and is_code_match:
+            # User asked for Code and we found a Code match
+            matches.append({
+                "row": row,
+                "score": 1.0,
+                "reason": "Direct Code match",
+                "location_score": 1.0
+            })
+            continue
+        elif not id_requested and not code_requested and (is_id_match or is_code_match):
+            # User didn't specify, so match either
+            matches.append({
+                "row": row,
+                "score": 1.0,
+                "reason": "Direct Code/ID match",
+                "location_score": 1.0
             })
             continue
             
@@ -367,17 +386,27 @@ def chat():
         provincia_score = (provincia_fuzzy * 0.3) + (provincia_overlap_score * 0.7)
         direccion_score = (direccion_fuzzy * 0.4) + (direccion_overlap_score * 0.6)
         
+        # Check if this is a strong address match (e.g., "Peru 38")
+        # This happens when both nombre and direccion have high scores
+        is_strong_address_match = (nombre_score > 0.6 and direccion_score > 0.6) or (nombre_overlap_score > 0.7 and direccion_overlap_score > 0.7)
+        
         # Calculate final score based on what matched
         # CRITICAL: If both city AND province have decent matches, give massive boost
         if (poblacion_score > 0.35 and provincia_score > 0.35) or (direccion_score > 0.35 and (poblacion_score > 0.3 or provincia_score > 0.3)):
             # Both location fields match - this is very likely the right center
             # But if nombre also has a good match, prioritize it
-            if nombre_score > 0.5 or direccion_score > 0.5:
-                # Strong name match with location match - highest priority
+            if is_strong_address_match:
+                # EXACT ADDRESS MATCH - highest priority (e.g., "Peru 38" in Barcelona)
+                final_score = (poblacion_score + provincia_score + direccion_score + nombre_score * 3) / 2.0
+            elif nombre_score > 0.5 or direccion_score > 0.5:
+                # Strong name match with location match - high priority
                 final_score = (poblacion_score + provincia_score + direccion_score + nombre_score * 2) / 2.5
             else:
                 # Location match without strong name match
                 final_score = (poblacion_score + provincia_score + direccion_score) * 1.1
+        elif is_strong_address_match:
+            # Strong address match without location - still very high priority
+            final_score = max(nombre_score, direccion_score) * 1.2
         elif nombre_score > 0.5 or direccion_score > 0.5:
             # Strong name match alone
             final_score = max(nombre_score, direccion_score) * 0.95
@@ -442,10 +471,8 @@ def chat():
         detail_lines = []
         if id_requested and not code_requested:
             detail_lines.append(f"Center ID: {best_match['id_centro']}")
-            detail_lines.append(f"Center Code: {best_match['codigo']}")
         elif code_requested and not id_requested:
             detail_lines.append(f"Center Code: {best_match['codigo']}")
-            detail_lines.append(f"Center ID: {best_match['id_centro']}")
         else:
             detail_lines.append(f"Center ID: {best_match['id_centro']}")
             detail_lines.append(f"Center Code: {best_match['codigo']}")
@@ -478,13 +505,27 @@ def chat():
                 response += "<br>Machine details aren't available in the system yet. Please contact support if you need an exact count."
         else:
             # Multiple similar matches - ask for clarification
-            response = "I found multiple centers matching your query. Please specify which one you're referring to:<br><br>"
-            for i, match in enumerate(matches, 1):
+            # Limit to top 10 results to avoid overwhelming the user
+            max_results = 10
+            response = f"I found {len(matches)} centers matching your query. "
+            if len(matches) > max_results:
+                response += f"Here are the top {max_results}. "
+            response += "Please specify which one you're referring to:<br><br>"
+            
+            for i, match in enumerate(matches[:max_results], 1):
                 row = match['row']
-                line = f"{i}. **{row['nombre']}** – {row['provincia']} (Code: {row['codigo']}"
-                if id_requested:
-                    line += f", ID: {row['id_centro']}"
-                line += ")<br>"
+                line = f"{i}. **{row['nombre']}** – {row['provincia']}"
+                
+                details = []
+                if id_requested and not code_requested:
+                    details.append(f"ID: {row['id_centro']}")
+                elif code_requested and not id_requested:
+                    details.append(f"Code: {row['codigo']}")
+                else:
+                    details.append(f"Code: {row['codigo']}")
+                    details.append(f"ID: {row['id_centro']}")
+                
+                line += f" ({', '.join(details)})<br>"
                 response += line
 
     return jsonify({"response": response})
