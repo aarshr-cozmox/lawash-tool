@@ -67,6 +67,20 @@ def normalize_text(text):
         text = " ".join(new_words)
     except Exception:
         pass  # If conversion fails, keep original text
+    # Common synonym/alias replacements to align user wording with dataset entries
+    replacements = {
+        "saint": "sant",
+        "san": "sant",
+        "andrews": "andreu",
+        "andrew": "andreu",
+        "sardinia": "sardenya",
+        "sardenia": "sardenya",
+        "barca": "barca",
+        "tenerife": "tenerife",
+        "tenerfaith": "tenerife"
+    }
+    for old, new in replacements.items():
+        text = re.sub(rf"\b{old}\b", new, text)
         
     return text
 
@@ -91,6 +105,8 @@ def chat():
         "de", "la", "el", "los", "las", "en", "y", "del", "a"
     ]
     query_words = [w for w in normalized_query.split() if w not in stopwords]
+    machine_keywords = {"machine", "machines", "lavadora", "lavadoras", "washer", "washers", "secadora", "secadoras", "dryer", "dryers", "equipment"}
+    machine_info_requested = any(kw in normalized_query.split() for kw in machine_keywords)
     
     if not query_words:
         return jsonify({"response": "Please specify a center name, city, or province."})
@@ -127,7 +143,9 @@ def chat():
             (row_code_clean and row_code_clean in normalized_query_compact)):
             matches.append({
                 'row': row,
-                'score': 1.0  # Perfect match
+                'score': 1.0,  # Perfect match
+                'location_score': 1.0,
+                'nombre_score': 1.0
             })
             continue
             
@@ -250,11 +268,18 @@ def chat():
         if final_score >= 0.4:
             matches.append({
                 'row': row,
-                'score': final_score
+                'score': final_score,
+                'location_score': max(poblacion_score, provincia_score),
+                'nombre_score': nombre_score
             })
     
     # Sort matches by score in descending order
     matches.sort(key=lambda x: x['score'], reverse=True)
+    
+    # Prioritize matches that strongly hit the requested location
+    location_strong_matches = [m for m in matches if m['location_score'] >= 0.4]
+    if location_strong_matches:
+        matches = location_strong_matches
     
     if not matches:
         response = "I couldn't find a center matching your description."
@@ -265,6 +290,8 @@ def chat():
         response += f"Center ID: {best_match['id_centro']}<br>"
         response += f"Code: {best_match['codigo']}<br>"
         response += f"Location: {best_match['direccion']}"
+        if machine_info_requested:
+            response += "<br>Machine details aren't available in the system yet. Please contact support if you need an exact count."
     else:
         # Multiple matches - check if top match is significantly better
         top_score = matches[0]['score']
@@ -277,6 +304,8 @@ def chat():
             response += f"Center ID: {best_match['id_centro']}<br>"
             response += f"Code: {best_match['codigo']}<br>"
             response += f"Location: {best_match['direccion']}"
+            if machine_info_requested:
+                response += "<br>Machine details aren't available in the system yet. Please contact support if you need an exact count."
         else:
             # Multiple similar matches - ask for clarification
             response = "I found multiple centers matching your query. Please specify which one you're referring to:<br><br>"
