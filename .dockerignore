@@ -5,8 +5,10 @@ __pycache__/
 *.so
 .Python
 venv/
+.venv/
 env/
 ENV/
+*.egg-info/
 
 # IDE
 .vscode/
@@ -20,3 +22,24 @@ Thumbs.db
 
 # Logs
 *.log
+
+# Git
+.git/
+.gitignore
+
+# Testing
+test_*.py
+debug_*.py
+reproduce_*.py
+.pytest_cache/
+.coverage
+htmlcov/
+tests/
+
+# Documentation
+README.md
+SEARCH_IMPROVEMENTS.md
+
+# Development
+requirements-dev.txt
+docker-compose.yml

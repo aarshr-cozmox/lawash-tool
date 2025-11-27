@@ -55,33 +55,48 @@ def normalize_text(text):
                   if unicodedata.category(c) != 'Mn').lower()
     
     # Convert number words to digits (e.g., "two hundred" -> "200")
+    # Define number words to identify sequences
+    number_words = {
+        'zero', 'one', 'two', 'three', 'four', 'five', 'six', 'seven', 'eight', 'nine',
+        'ten', 'eleven', 'twelve', 'thirteen', 'fourteen', 'fifteen', 'sixteen', 
+        'seventeen', 'eighteen', 'nineteen', 'twenty', 'thirty', 'forty', 'fifty',
+        'sixty', 'seventy', 'eighty', 'ninety', 'hundred', 'thousand', 'million', 'and'
+    }
+    
     try:
-        # Extract potential number words sequences
-        # This is a simple approach; for complex sentences it might need more care
-        # but w2n.word_to_num is robust enough for "two hundred"
         words = text.split()
         new_words = []
         i = 0
+        
         while i < len(words):
-            # Try to convert chunks of words
-            chunk_converted = False
-            for j in range(len(words), i, -1):
-                chunk = " ".join(words[i:j])
+            # Check if current word is a number word
+            if words[i] in number_words:
+                # Collect consecutive number words (including 'and' as connector)
+                number_sequence = []
+                j = i
+                while j < len(words) and words[j] in number_words:
+                    number_sequence.append(words[j])
+                    j += 1
+                
+                # Try to convert the sequence
                 try:
-                    num = w2n.word_to_num(chunk)
+                    num_str = " ".join(number_sequence)
+                    num = w2n.word_to_num(num_str)
                     new_words.append(str(num))
                     i = j
-                    chunk_converted = True
-                    break
                 except ValueError:
-                    continue
-            
-            if not chunk_converted:
+                    # If conversion fails, keep the words as-is
+                    new_words.extend(number_sequence)
+                    i = j
+            else:
+                # Not a number word, keep as-is
                 new_words.append(words[i])
                 i += 1
+        
         text = " ".join(new_words)
     except Exception:
         pass  # If conversion fails, keep original text
+    
     # Common synonym/alias replacements to align user wording with dataset entries
     replacements = {
         "saint": "sant",
