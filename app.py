@@ -1,20 +1,30 @@
 from flask import Flask, request, jsonify
+from flask_cors import CORS
 import pandas as pd
 import json
 import os
 import unicodedata
+import logging
 from difflib import SequenceMatcher
 
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
+
 app = Flask(__name__)
+CORS(app)  # Enable CORS for all routes
 
 # Load data
 try:
     with open('centers.json', 'r') as f:
         data = json.load(f)
     df = pd.DataFrame(data['centers'])
-    print("Data loaded successfully.")
+    logger.info("Data loaded successfully. %d centers found.", len(df))
 except Exception as e:
-    print(f"Error loading data: {e}")
+    logger.error(f"Error loading data: {e}")
     df = pd.DataFrame()
 
 
@@ -56,58 +66,129 @@ def chat():
         df['norm_provincia'] = df['provincia'].apply(normalize_text)
 
     # Fuzzy matching logic with hybrid scoring
-    best_score = 0
-    best_match = None
+    matches = []  # Store all potential matches with their scores
     query_string = " ".join(query_words)
     query_tokens = set(query_words)
     
     for _, row in df.iterrows():
-        # Calculate fuzzy similarity for each field
-        nombre_fuzzy = fuzzy_similarity(query_string, row['norm_nombre'])
-        poblacion_fuzzy = fuzzy_similarity(query_string, row['norm_poblacion'])
-        provincia_fuzzy = fuzzy_similarity(query_string, row['norm_provincia'])
+        # Token overlap scoring - must have at least some overlap
+        # Remove stopwords from row data for better overlap calculation
+        row_nombre_tokens = set([w for w in row['norm_nombre'].split() if w not in stopwords])
+        row_poblacion_tokens = set([w for w in row['norm_poblacion'].split() if w not in stopwords])
+        row_provincia_tokens = set([w for w in row['norm_provincia'].split() if w not in stopwords])
         
-        # Token overlap scoring (semantic-like boost)
-        nombre_tokens = set(row['norm_nombre'].split())
-        poblacion_tokens = set(row['norm_poblacion'].split())
-        provincia_tokens = set(row['norm_provincia'].split())
+        # Fallback to original tokens if filtering removed everything (unlikely but possible)
+        if not row_nombre_tokens: row_nombre_tokens = set(row['norm_nombre'].split())
+        if not row_poblacion_tokens: row_poblacion_tokens = set(row['norm_poblacion'].split())
+        if not row_provincia_tokens: row_provincia_tokens = set(row['norm_provincia'].split())
         
-        nombre_overlap = len(query_tokens & nombre_tokens) / max(len(query_tokens), 1)
-        poblacion_overlap = len(query_tokens & poblacion_tokens) / max(len(query_tokens), 1)
-        provincia_overlap = len(query_tokens & provincia_tokens) / max(len(query_tokens), 1)
+        # Check for any token overlap
+        nombre_overlap = len(query_tokens & row_nombre_tokens)
+        poblacion_overlap = len(query_tokens & row_poblacion_tokens)
+        provincia_overlap = len(query_tokens & row_provincia_tokens)
         
-        # Hybrid score: fuzzy is primary, token overlap provides boost
-        nombre_score = (nombre_fuzzy * 0.8) + (nombre_overlap * 0.2)
-        poblacion_score = (poblacion_fuzzy * 0.8) + (poblacion_overlap * 0.2)
-        provincia_score = (provincia_fuzzy * 0.8) + (provincia_overlap * 0.2)
+        # Also check for substring matches (e.g., "sebastian" in "san sebastian")
+        nombre_substring_match = any(
+            qt in row['norm_nombre'] or row['norm_nombre'] in qt 
+            for qt in query_tokens if len(qt) > 3
+        )
+        poblacion_substring_match = any(
+            qt in row['norm_poblacion'] or row['norm_poblacion'] in qt 
+            for qt in query_tokens if len(qt) > 3
+        )
+        provincia_substring_match = any(
+            qt in row['norm_provincia'] or row['norm_provincia'] in qt 
+            for qt in query_tokens if len(qt) > 3
+        )
         
+        # Skip if there's no overlap or substring match at all
+        if (nombre_overlap == 0 and poblacion_overlap == 0 and provincia_overlap == 0 and
+            not nombre_substring_match and not poblacion_substring_match and not provincia_substring_match):
+            continue
+        
+        # Calculate fuzzy similarity for fields with some overlap
+        # Only calculate fuzzy if there is some relevance to save computation and reduce noise
+        nombre_fuzzy = fuzzy_similarity(query_string, row['norm_nombre']) if (nombre_overlap > 0 or nombre_substring_match) else 0
+        poblacion_fuzzy = fuzzy_similarity(query_string, row['norm_poblacion']) if (poblacion_overlap > 0 or poblacion_substring_match) else 0
+        provincia_fuzzy = fuzzy_similarity(query_string, row['norm_provincia']) if (provincia_overlap > 0 or provincia_substring_match) else 0
+        
+        # Normalized overlap scores - use Jaccard-like ratio but favor query coverage
+        # Denominator is max of query length or row length to penalize length mismatch, 
+        # but we use a soft max to be lenient
+        nombre_overlap_score = nombre_overlap / max(len(query_tokens), len(row_nombre_tokens)) if row_nombre_tokens else 0
+        poblacion_overlap_score = poblacion_overlap / max(len(query_tokens), len(row_poblacion_tokens)) if row_poblacion_tokens else 0
+        provincia_overlap_score = provincia_overlap / max(len(query_tokens), len(row_provincia_tokens)) if row_provincia_tokens else 0
+        
+        # Hybrid score: combine fuzzy and overlap, with overlap being more important
+        nombre_score = (nombre_fuzzy * 0.3) + (nombre_overlap_score * 0.7)
+        poblacion_score = (poblacion_fuzzy * 0.3) + (poblacion_overlap_score * 0.7)
+        provincia_score = (provincia_fuzzy * 0.3) + (provincia_overlap_score * 0.7)
+        
+        # Calculate final score based on what matched
         # CRITICAL: If both city AND province have decent matches, give massive boost
-        # This handles queries like "San Sebastian at Guipuzcoa"
-        if poblacion_score > 0.3 and provincia_score > 0.3:
+        if poblacion_score > 0.35 and provincia_score > 0.35:
             # Both location fields match - this is very likely the right center
-            combined_boost = (poblacion_score + provincia_score) * 1.5
-            final_score = combined_boost
+            # But if nombre also has a good match, prioritize it
+            if nombre_score > 0.5:
+                # Strong name match with location match - highest priority
+                final_score = (poblacion_score + provincia_score + nombre_score * 2) / 2
+            else:
+                # Location match without strong name match
+                final_score = (poblacion_score + provincia_score) * 1.2
+        elif nombre_score > 0.5:
+            # Strong name match alone
+            final_score = nombre_score * 0.9
+        elif poblacion_score > 0.5 or provincia_score > 0.5:
+            # Strong location match
+            final_score = max(poblacion_score, provincia_score) * 0.8
         else:
-            # Standard scoring when only one field matches
+            # Weak matches - combine all signals
             final_score = max(
-                nombre_score * 0.4,
-                poblacion_score * 0.7,
-                provincia_score * 0.6,
-                (poblacion_score + provincia_score) / 2 * 0.75
+                nombre_score * 0.7,
+                poblacion_score * 0.8,
+                provincia_score * 0.7,
+                (poblacion_score + provincia_score) / 2 * 0.85
             )
         
-        if final_score > best_score:
-            best_score = final_score
-            best_match = row
+        # Only collect matches with meaningful scores
+        # Threshold 0.4 allows for "Sebastian Bay" (partial match) but blocks "Guadarrama" vs "Quarteira" (no match)
+        if final_score >= 0.4:
+            matches.append({
+                'row': row,
+                'score': final_score
+            })
     
-    # Require at least 35% similarity for better recall with typos
-    if best_match is not None and best_score >= 0.35:
+    # Sort matches by score in descending order
+    matches.sort(key=lambda x: x['score'], reverse=True)
+    
+    if not matches:
+        response = "I couldn't find a center matching your description."
+    elif len(matches) == 1:
+        # Single match - return it directly
+        best_match = matches[0]['row']
         response = f"I believe you're referring to **{best_match['nombre']}** in {best_match['poblacion']}.<br>"
         response += f"Center ID: {best_match['id_centro']}<br>"
         response += f"Code: {best_match['codigo']}<br>"
         response += f"Location: {best_match['direccion']}"
     else:
-        response = "I couldn't find a center matching your description."
+        # Multiple matches - check if top match is significantly better
+        top_score = matches[0]['score']
+        second_score = matches[1]['score']
+        
+        # If the top match is significantly better (>15% difference), return it
+        if top_score - second_score > 0.15:
+            best_match = matches[0]['row']
+            response = f"I believe you're referring to **{best_match['nombre']}** in {best_match['poblacion']}.<br>"
+            response += f"Center ID: {best_match['id_centro']}<br>"
+            response += f"Code: {best_match['codigo']}<br>"
+            response += f"Location: {best_match['direccion']}"
+        else:
+            # Multiple similar matches - ask for clarification
+            response = "I found multiple centers matching your query. Please specify which one you're referring to:<br><br>"
+            for i, match in enumerate(matches[:5], 1):  # Show up to 5 matches
+                row = match['row']
+                response += f"{i}. **{row['nombre']}** - {row['direccion']}, {row['poblacion']}, {row['provincia']}<br>"
+                response += f"   Center ID: {row['id_centro']}, Code: {row['codigo']}<br><br>"
 
     return jsonify({"response": response})
 
