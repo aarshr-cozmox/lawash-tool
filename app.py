@@ -6,6 +6,9 @@ import os
 import unicodedata
 import logging
 from difflib import SequenceMatcher
+from word2number import w2n
+import jellyfish
+import re
 
 # Configure logging
 logging.basicConfig(
@@ -31,8 +34,41 @@ except Exception as e:
 def normalize_text(text):
     if not isinstance(text, str):
         return ""
-    return ''.join(c for c in unicodedata.normalize('NFD', text)
+    
+    # Normalize unicode characters
+    text = ''.join(c for c in unicodedata.normalize('NFD', text)
                   if unicodedata.category(c) != 'Mn').lower()
+    
+    # Convert number words to digits (e.g., "two hundred" -> "200")
+    try:
+        # Extract potential number words sequences
+        # This is a simple approach; for complex sentences it might need more care
+        # but w2n.word_to_num is robust enough for "two hundred"
+        words = text.split()
+        new_words = []
+        i = 0
+        while i < len(words):
+            # Try to convert chunks of words
+            chunk_converted = False
+            for j in range(len(words), i, -1):
+                chunk = " ".join(words[i:j])
+                try:
+                    num = w2n.word_to_num(chunk)
+                    new_words.append(str(num))
+                    i = j
+                    chunk_converted = True
+                    break
+                except ValueError:
+                    continue
+            
+            if not chunk_converted:
+                new_words.append(words[i])
+                i += 1
+        text = " ".join(new_words)
+    except Exception:
+        pass  # If conversion fails, keep original text
+        
+    return text
 
 def fuzzy_similarity(str1, str2):
     """Calculate similarity ratio between two strings (0.0 to 1.0)"""
@@ -70,14 +106,26 @@ def chat():
     query_string = " ".join(query_words)
     query_tokens = set(query_words)
     
+    # Pre-calculate phonetic codes for query tokens
+    query_phonetics = {qt: jellyfish.metaphone(qt) for qt in query_tokens if len(qt) > 2}
+    
     for _, row in df.iterrows():
+        # 1. Direct Code/ID Match (Highest Priority)
+        # Check if any query token exactly matches id_centro or codigo (case-insensitive)
+        if str(row['id_centro']).lower() in query_tokens or str(row['codigo']).lower() in query_tokens:
+            matches.append({
+                'row': row,
+                'score': 1.0  # Perfect match
+            })
+            continue
+            
         # Token overlap scoring - must have at least some overlap
         # Remove stopwords from row data for better overlap calculation
         row_nombre_tokens = set([w for w in row['norm_nombre'].split() if w not in stopwords])
         row_poblacion_tokens = set([w for w in row['norm_poblacion'].split() if w not in stopwords])
         row_provincia_tokens = set([w for w in row['norm_provincia'].split() if w not in stopwords])
         
-        # Fallback to original tokens if filtering removed everything (unlikely but possible)
+        # Fallback to original tokens if filtering removed everything
         if not row_nombre_tokens: row_nombre_tokens = set(row['norm_nombre'].split())
         if not row_poblacion_tokens: row_poblacion_tokens = set(row['norm_poblacion'].split())
         if not row_provincia_tokens: row_provincia_tokens = set(row['norm_provincia'].split())
@@ -86,6 +134,16 @@ def chat():
         nombre_overlap = len(query_tokens & row_nombre_tokens)
         poblacion_overlap = len(query_tokens & row_poblacion_tokens)
         provincia_overlap = len(query_tokens & row_provincia_tokens)
+        
+        # Phonetic matching
+        # Check if query phonetics match row phonetics
+        row_nombre_phonetics = {w: jellyfish.metaphone(w) for w in row_nombre_tokens if len(w) > 2}
+        row_poblacion_phonetics = {w: jellyfish.metaphone(w) for w in row_poblacion_tokens if len(w) > 2}
+        row_provincia_phonetics = {w: jellyfish.metaphone(w) for w in row_provincia_tokens if len(w) > 2}
+        
+        nombre_phonetic_match = any(qp in row_nombre_phonetics.values() for qp in query_phonetics.values())
+        poblacion_phonetic_match = any(qp in row_poblacion_phonetics.values() for qp in query_phonetics.values())
+        provincia_phonetic_match = any(qp in row_provincia_phonetics.values() for qp in query_phonetics.values())
         
         # Also check for substring matches (e.g., "sebastian" in "san sebastian")
         nombre_substring_match = any(
@@ -101,24 +159,28 @@ def chat():
             for qt in query_tokens if len(qt) > 3
         )
         
-        # Skip if there's no overlap or substring match at all
+        # Skip if there's no overlap, phonetic match, or substring match at all
         if (nombre_overlap == 0 and poblacion_overlap == 0 and provincia_overlap == 0 and
+            not nombre_phonetic_match and not poblacion_phonetic_match and not provincia_phonetic_match and
             not nombre_substring_match and not poblacion_substring_match and not provincia_substring_match):
             continue
         
         # Calculate fuzzy similarity for fields with some overlap
         # Only calculate fuzzy if there is some relevance to save computation and reduce noise
-        nombre_fuzzy = fuzzy_similarity(query_string, row['norm_nombre']) if (nombre_overlap > 0 or nombre_substring_match) else 0
-        poblacion_fuzzy = fuzzy_similarity(query_string, row['norm_poblacion']) if (poblacion_overlap > 0 or poblacion_substring_match) else 0
-        provincia_fuzzy = fuzzy_similarity(query_string, row['norm_provincia']) if (provincia_overlap > 0 or provincia_substring_match) else 0
+        nombre_fuzzy = fuzzy_similarity(query_string, row['norm_nombre']) if (nombre_overlap > 0 or nombre_phonetic_match or nombre_substring_match) else 0
+        poblacion_fuzzy = fuzzy_similarity(query_string, row['norm_poblacion']) if (poblacion_overlap > 0 or poblacion_phonetic_match or poblacion_substring_match) else 0
+        provincia_fuzzy = fuzzy_similarity(query_string, row['norm_provincia']) if (provincia_overlap > 0 or provincia_phonetic_match or provincia_substring_match) else 0
         
         # Normalized overlap scores - use Jaccard-like ratio but favor query coverage
-        # Denominator is max of query length or row length to penalize length mismatch, 
-        # but we use a soft max to be lenient
         nombre_overlap_score = nombre_overlap / max(len(query_tokens), len(row_nombre_tokens)) if row_nombre_tokens else 0
         poblacion_overlap_score = poblacion_overlap / max(len(query_tokens), len(row_poblacion_tokens)) if row_poblacion_tokens else 0
         provincia_overlap_score = provincia_overlap / max(len(query_tokens), len(row_provincia_tokens)) if row_provincia_tokens else 0
         
+        # Boost for phonetic matches
+        if nombre_phonetic_match: nombre_overlap_score = max(nombre_overlap_score, 0.5)
+        if poblacion_phonetic_match: poblacion_overlap_score = max(poblacion_overlap_score, 0.5)
+        if provincia_phonetic_match: provincia_overlap_score = max(provincia_overlap_score, 0.5)
+
         # Hybrid score: combine fuzzy and overlap, with overlap being more important
         nombre_score = (nombre_fuzzy * 0.3) + (nombre_overlap_score * 0.7)
         poblacion_score = (poblacion_fuzzy * 0.3) + (poblacion_overlap_score * 0.7)
@@ -151,7 +213,6 @@ def chat():
             )
         
         # Only collect matches with meaningful scores
-        # Threshold 0.4 allows for "Sebastian Bay" (partial match) but blocks "Guadarrama" vs "Quarteira" (no match)
         if final_score >= 0.4:
             matches.append({
                 'row': row,
