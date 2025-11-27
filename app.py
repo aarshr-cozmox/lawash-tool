@@ -105,14 +105,26 @@ def chat():
     matches = []  # Store all potential matches with their scores
     query_string = " ".join(query_words)
     query_tokens = set(query_words)
+    # Additional normalized versions of tokens for code/id detection
+    clean_token = lambda t: re.sub(r'[^a-z0-9]', '', t)
+    query_tokens_clean = {clean_token(t) for t in query_tokens if clean_token(t)}
+    normalized_query_compact = clean_token(normalized_query)
     
     # Pre-calculate phonetic codes for query tokens
     query_phonetics = {qt: jellyfish.metaphone(qt) for qt in query_tokens if len(qt) > 2}
     
     for _, row in df.iterrows():
+        row_id = str(row['id_centro']).lower()
+        row_code = str(row['codigo']).lower()
+        row_id_clean = clean_token(row_id)
+        row_code_clean = clean_token(row_code)
         # 1. Direct Code/ID Match (Highest Priority)
         # Check if any query token exactly matches id_centro or codigo (case-insensitive)
-        if str(row['id_centro']).lower() in query_tokens or str(row['codigo']).lower() in query_tokens:
+        if (row_id in query_tokens or
+            row_code in query_tokens or
+            row_id_clean in query_tokens_clean or
+            row_code_clean in query_tokens_clean or
+            (row_code_clean and row_code_clean in normalized_query_compact)):
             matches.append({
                 'row': row,
                 'score': 1.0  # Perfect match
@@ -134,6 +146,20 @@ def chat():
         nombre_overlap = len(query_tokens & row_nombre_tokens)
         poblacion_overlap = len(query_tokens & row_poblacion_tokens)
         provincia_overlap = len(query_tokens & row_provincia_tokens)
+        # Token-level fuzzy matches to catch close spellings (e.g., "sardinia" vs "sardenya")
+        def token_fuzzy_match(target_tokens):
+            for qt in query_tokens:
+                if len(qt) <= 2:
+                    continue
+                for tt in target_tokens:
+                    if len(tt) <= 2:
+                        continue
+                    if jellyfish.jaro_winkler_similarity(qt, tt) >= 0.88:
+                        return True
+            return False
+        nombre_token_fuzzy = token_fuzzy_match(row_nombre_tokens)
+        poblacion_token_fuzzy = token_fuzzy_match(row_poblacion_tokens)
+        provincia_token_fuzzy = token_fuzzy_match(row_provincia_tokens)
         
         # Phonetic matching
         # Check if query phonetics match row phonetics
@@ -159,27 +185,35 @@ def chat():
             for qt in query_tokens if len(qt) > 3
         )
         
-        # Skip if there's no overlap, phonetic match, or substring match at all
-        if (nombre_overlap == 0 and poblacion_overlap == 0 and provincia_overlap == 0 and
+        # Pre-calculate fuzzy scores for guard and reuse later
+        nombre_fuzzy_full = fuzzy_similarity(query_string, row['norm_nombre'])
+        poblacion_fuzzy_full = fuzzy_similarity(query_string, row['norm_poblacion'])
+        provincia_fuzzy_full = fuzzy_similarity(query_string, row['norm_provincia'])
+        fuzzy_override_match = max(nombre_fuzzy_full, poblacion_fuzzy_full, provincia_fuzzy_full) >= 0.7
+        
+        # Skip if there's no overlap, phonetic match, substring match, token fuzzy, or strong fuzzy match
+        if (not fuzzy_override_match and
+            nombre_overlap == 0 and poblacion_overlap == 0 and provincia_overlap == 0 and
             not nombre_phonetic_match and not poblacion_phonetic_match and not provincia_phonetic_match and
-            not nombre_substring_match and not poblacion_substring_match and not provincia_substring_match):
+            not nombre_substring_match and not poblacion_substring_match and not provincia_substring_match and
+            not nombre_token_fuzzy and not poblacion_token_fuzzy and not provincia_token_fuzzy):
             continue
         
         # Calculate fuzzy similarity for fields with some overlap
         # Only calculate fuzzy if there is some relevance to save computation and reduce noise
-        nombre_fuzzy = fuzzy_similarity(query_string, row['norm_nombre']) if (nombre_overlap > 0 or nombre_phonetic_match or nombre_substring_match) else 0
-        poblacion_fuzzy = fuzzy_similarity(query_string, row['norm_poblacion']) if (poblacion_overlap > 0 or poblacion_phonetic_match or poblacion_substring_match) else 0
-        provincia_fuzzy = fuzzy_similarity(query_string, row['norm_provincia']) if (provincia_overlap > 0 or provincia_phonetic_match or provincia_substring_match) else 0
+        nombre_fuzzy = nombre_fuzzy_full if (nombre_overlap > 0 or nombre_phonetic_match or nombre_substring_match or fuzzy_override_match) else 0
+        poblacion_fuzzy = poblacion_fuzzy_full if (poblacion_overlap > 0 or poblacion_phonetic_match or poblacion_substring_match or fuzzy_override_match) else 0
+        provincia_fuzzy = provincia_fuzzy_full if (provincia_overlap > 0 or provincia_phonetic_match or provincia_substring_match or fuzzy_override_match) else 0
         
         # Normalized overlap scores - use Jaccard-like ratio but favor query coverage
         nombre_overlap_score = nombre_overlap / max(len(query_tokens), len(row_nombre_tokens)) if row_nombre_tokens else 0
         poblacion_overlap_score = poblacion_overlap / max(len(query_tokens), len(row_poblacion_tokens)) if row_poblacion_tokens else 0
         provincia_overlap_score = provincia_overlap / max(len(query_tokens), len(row_provincia_tokens)) if row_provincia_tokens else 0
         
-        # Boost for phonetic matches
-        if nombre_phonetic_match: nombre_overlap_score = max(nombre_overlap_score, 0.5)
-        if poblacion_phonetic_match: poblacion_overlap_score = max(poblacion_overlap_score, 0.5)
-        if provincia_phonetic_match: provincia_overlap_score = max(provincia_overlap_score, 0.5)
+        # Boost for phonetic or token-level fuzzy matches
+        if nombre_phonetic_match or nombre_token_fuzzy: nombre_overlap_score = max(nombre_overlap_score, 0.6)
+        if poblacion_phonetic_match or poblacion_token_fuzzy: poblacion_overlap_score = max(poblacion_overlap_score, 0.6)
+        if provincia_phonetic_match or provincia_token_fuzzy: provincia_overlap_score = max(provincia_overlap_score, 0.6)
 
         # Hybrid score: combine fuzzy and overlap, with overlap being more important
         nombre_score = (nombre_fuzzy * 0.3) + (nombre_overlap_score * 0.7)
@@ -246,10 +280,9 @@ def chat():
         else:
             # Multiple similar matches - ask for clarification
             response = "I found multiple centers matching your query. Please specify which one you're referring to:<br><br>"
-            for i, match in enumerate(matches[:5], 1):  # Show up to 5 matches
+            for i, match in enumerate(matches, 1):
                 row = match['row']
-                response += f"{i}. **{row['nombre']}** - {row['direccion']}, {row['poblacion']}, {row['provincia']}<br>"
-                response += f"   Center ID: {row['id_centro']}, Code: {row['codigo']}<br><br>"
+                response += f"{i}. **{row['nombre']}** – {row['provincia']} (Code: {row['codigo']})<br>"
 
     return jsonify({"response": response})
 
