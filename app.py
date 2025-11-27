@@ -17,19 +17,67 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+STOPWORDS = [
+    "what", "is", "the", "center", "centre", "id", "and", "code", "for", "my", "located", "at", "in",
+    "show", "me", "tell", "give", "result", "query", "details", "poblacion", "province", "city",
+    "de", "la", "el", "los", "las", "en", "y", "del", "a", "please", "por", "favor"
+]
+
 app = Flask(__name__)
 CORS(app)  # Enable CORS for all routes
 
 # Load data
+location_index = {"city": [], "province": []}
+
+def build_location_entries(values):
+    entries = []
+    seen = set()
+    for val in values:
+        if not isinstance(val, str):
+            continue
+        if not val or val in seen:
+            continue
+        seen.add(val)
+        tokens = set(w for w in val.split() if w not in STOPWORDS)
+        if not tokens:
+            tokens = set(val.split())
+        entries.append({"value": val, "tokens": tokens})
+    return entries
+
 try:
     with open('centers.json', 'r') as f:
         data = json.load(f)
     df = pd.DataFrame(data['centers'])
+    if not df.empty:
+        df['norm_nombre'] = df['nombre'].apply(lambda x: normalize_text(x))
+        df['norm_poblacion'] = df['poblacion'].apply(lambda x: normalize_text(x))
+        df['norm_provincia'] = df['provincia'].apply(lambda x: normalize_text(x))
+        location_index["city"] = build_location_entries(df['norm_poblacion'].dropna().unique())
+        location_index["province"] = build_location_entries(df['norm_provincia'].dropna().unique())
     logger.info("Data loaded successfully. %d centers found.", len(df))
 except Exception as e:
     logger.error(f"Error loading data: {e}")
     df = pd.DataFrame()
 
+def detect_location_candidates(query_tokens, query_string, entries):
+    hints = set()
+    if not entries or not query_tokens:
+        return hints
+    for entry in entries:
+        tokens = entry['tokens']
+        if not tokens:
+            continue
+        overlap = len(tokens & query_tokens)
+        token_ratio = overlap / len(tokens) if tokens else 0
+        if overlap == len(tokens) or (len(tokens) > 1 and token_ratio >= 0.6) or (len(tokens) == 1 and overlap == 1):
+            hints.add(entry['value'])
+            continue
+        if overlap >= 1 and token_ratio >= 0.4:
+            hints.add(entry['value'])
+            continue
+        if fuzzy_similarity(query_string, entry['value']) >= 0.88:
+            hints.add(entry['value'])
+    return hints
 
 def normalize_text(text):
     if not isinstance(text, str):
@@ -73,9 +121,16 @@ def normalize_text(text):
         "san": "sant",
         "andrews": "andreu",
         "andrew": "andreu",
+        "andrea": "andreu",
+        "andres": "andreu",
         "sardinia": "sardenya",
         "sardenia": "sardenya",
+        "della": "de la",
+        "dalla": "de la",
+        "dela": "de la",
         "barca": "barca",
+        "barka": "barca",
+        "barqa": "barca",
         "tenerife": "tenerife",
         "tenerfaith": "tenerife"
     }
@@ -99,28 +154,35 @@ def chat():
     normalized_query = normalize_text(user_message)
     
     # Remove stopwords
-    stopwords = [
-        "what", "is", "the", "center", "centre", "id", "and", "code", "for", "my", "located", "at", "in", 
-        "show", "me", "tell", "give", "result", "query", "details", "poblacion", "province", "city",
-        "de", "la", "el", "los", "las", "en", "y", "del", "a"
-    ]
-    query_words = [w for w in normalized_query.split() if w not in stopwords]
+    raw_words = normalized_query.split()
+    raw_clean_tokens = [re.sub(r'[^a-z0-9]', '', w) for w in raw_words]
+    query_words = [w for w in raw_words if w not in STOPWORDS]
     machine_keywords = {"machine", "machines", "lavadora", "lavadoras", "washer", "washers", "secadora", "secadoras", "dryer", "dryers", "equipment"}
-    machine_info_requested = any(kw in normalized_query.split() for kw in machine_keywords)
+    machine_info_requested = any(kw in raw_words for kw in machine_keywords)
+    code_terms = {"code", "codigo", "codigo", "cod"}
+    id_terms = {"id", "identifier", "identificador", "identificacion", "identification"}
+    code_requested = any(token in code_terms for token in raw_clean_tokens if token)
+    id_requested = any(token in id_terms for token in raw_clean_tokens if token)
     
     if not query_words:
         return jsonify({"response": "Please specify a center name, city, or province."})
 
     # Pre-calculate normalized columns if not already done
-    if 'norm_nombre' not in df.columns:
+    if 'norm_nombre' not in df.columns and not df.empty:
         df['norm_nombre'] = df['nombre'].apply(normalize_text)
         df['norm_poblacion'] = df['poblacion'].apply(normalize_text)
         df['norm_provincia'] = df['provincia'].apply(normalize_text)
+        location_index["city"] = build_location_entries(df['norm_poblacion'].dropna().unique())
+        location_index["province"] = build_location_entries(df['norm_provincia'].dropna().unique())
 
     # Fuzzy matching logic with hybrid scoring
     matches = []  # Store all potential matches with their scores
     query_string = " ".join(query_words)
     query_tokens = set(query_words)
+    detected_city_hints = detect_location_candidates(query_tokens, normalized_query, location_index["city"]) if location_index["city"] else set()
+    detected_province_hints = detect_location_candidates(query_tokens, normalized_query, location_index["province"]) if location_index["province"] else set()
+    filter_by_city = len(detected_city_hints) > 0
+    filter_by_province = len(detected_province_hints) > 0
     # Additional normalized versions of tokens for code/id detection
     clean_token = lambda t: re.sub(r'[^a-z0-9]', '', t)
     query_tokens_clean = {clean_token(t) for t in query_tokens if clean_token(t)}
@@ -129,7 +191,14 @@ def chat():
     # Pre-calculate phonetic codes for query tokens
     query_phonetics = {qt: jellyfish.metaphone(qt) for qt in query_tokens if len(qt) > 2}
     
+    results = []
+    row_data_cache = []
     for _, row in df.iterrows():
+        row_data_cache.append(row)
+        if filter_by_city and row['norm_poblacion'] not in detected_city_hints:
+            continue
+        if filter_by_province and row['norm_provincia'] not in detected_province_hints:
+            continue
         row_id = str(row['id_centro']).lower()
         row_code = str(row['codigo']).lower()
         row_id_clean = clean_token(row_id)
@@ -151,9 +220,9 @@ def chat():
             
         # Token overlap scoring - must have at least some overlap
         # Remove stopwords from row data for better overlap calculation
-        row_nombre_tokens = set([w for w in row['norm_nombre'].split() if w not in stopwords])
-        row_poblacion_tokens = set([w for w in row['norm_poblacion'].split() if w not in stopwords])
-        row_provincia_tokens = set([w for w in row['norm_provincia'].split() if w not in stopwords])
+        row_nombre_tokens = set([w for w in row['norm_nombre'].split() if w not in STOPWORDS])
+        row_poblacion_tokens = set([w for w in row['norm_poblacion'].split() if w not in STOPWORDS])
+        row_provincia_tokens = set([w for w in row['norm_provincia'].split() if w not in STOPWORDS])
         
         # Fallback to original tokens if filtering removed everything
         if not row_nombre_tokens: row_nombre_tokens = set(row['norm_nombre'].split())
@@ -224,9 +293,12 @@ def chat():
         provincia_fuzzy = provincia_fuzzy_full if (provincia_overlap > 0 or provincia_phonetic_match or provincia_substring_match or fuzzy_override_match) else 0
         
         # Normalized overlap scores - use Jaccard-like ratio but favor query coverage
-        nombre_overlap_score = nombre_overlap / max(len(query_tokens), len(row_nombre_tokens)) if row_nombre_tokens else 0
-        poblacion_overlap_score = poblacion_overlap / max(len(query_tokens), len(row_poblacion_tokens)) if row_poblacion_tokens else 0
-        provincia_overlap_score = provincia_overlap / max(len(query_tokens), len(row_provincia_tokens)) if row_provincia_tokens else 0
+        nombre_overlap_score = (nombre_overlap / len(row_nombre_tokens)) if row_nombre_tokens else 0
+        poblacion_overlap_score = (poblacion_overlap / len(row_poblacion_tokens)) if row_poblacion_tokens else 0
+        provincia_overlap_score = (provincia_overlap / len(row_provincia_tokens)) if row_provincia_tokens else 0
+        nombre_overlap_score = min(nombre_overlap_score, 1.0)
+        poblacion_overlap_score = min(poblacion_overlap_score, 1.0)
+        provincia_overlap_score = min(provincia_overlap_score, 1.0)
         
         # Boost for phonetic or token-level fuzzy matches
         if nombre_phonetic_match or nombre_token_fuzzy: nombre_overlap_score = max(nombre_overlap_score, 0.6)
@@ -265,21 +337,43 @@ def chat():
             )
         
         # Only collect matches with meaningful scores
-        if final_score >= 0.4:
+        minimum_score = 0.35 if (filter_by_city or filter_by_province) else 0.4
+        if final_score >= minimum_score:
             matches.append({
                 'row': row,
                 'score': final_score,
                 'location_score': max(poblacion_score, provincia_score),
                 'nombre_score': nombre_score
             })
+            continue
+        # fallback scoring using combined fields for partial combos
+        combined_fields = [
+            row['norm_nombre'],
+            row['norm_poblacion'],
+            row['norm_provincia'],
+            row.get('direccion', '')
+        ]
+        combined_text = " ".join([cf for cf in combined_fields if isinstance(cf, str)])
+        combined_similarity = fuzzy_similarity(normalized_query, combined_text)
+        if combined_similarity >= 0.82:
+            matches.append({
+                'row': row,
+                'score': combined_similarity * 0.7,
+                'location_score': max(poblacion_score, provincia_score, combined_similarity),
+                'nombre_score': max(nombre_score, combined_similarity)
+            })
     
     # Sort matches by score in descending order
     matches.sort(key=lambda x: x['score'], reverse=True)
     
     # Prioritize matches that strongly hit the requested location
-    location_strong_matches = [m for m in matches if m['location_score'] >= 0.4]
+    location_threshold = 0.35 if (filter_by_city or filter_by_province) else 0.4
+    location_strong_matches = [m for m in matches if m['location_score'] >= location_threshold]
     if location_strong_matches:
         matches = location_strong_matches
+    elif filter_by_city or filter_by_province:
+        # fallback to best matches sorted even if location score slightly lower
+        matches = sorted(matches, key=lambda x: (x['location_score'], x['score']), reverse=True)
     
     if not matches:
         response = "I couldn't find a center matching your description."
@@ -287,9 +381,18 @@ def chat():
         # Single match - return it directly
         best_match = matches[0]['row']
         response = f"I believe you're referring to **{best_match['nombre']}** in {best_match['poblacion']}.<br>"
-        response += f"Center ID: {best_match['id_centro']}<br>"
-        response += f"Code: {best_match['codigo']}<br>"
-        response += f"Location: {best_match['direccion']}"
+        detail_lines = []
+        if id_requested and not code_requested:
+            detail_lines.append(f"Center ID: {best_match['id_centro']}")
+            detail_lines.append(f"Center Code: {best_match['codigo']}")
+        elif code_requested and not id_requested:
+            detail_lines.append(f"Center Code: {best_match['codigo']}")
+            detail_lines.append(f"Center ID: {best_match['id_centro']}")
+        else:
+            detail_lines.append(f"Center ID: {best_match['id_centro']}")
+            detail_lines.append(f"Center Code: {best_match['codigo']}")
+        detail_lines.append(f"Location: {best_match['direccion']}")
+        response += "<br>".join(detail_lines)
         if machine_info_requested:
             response += "<br>Machine details aren't available in the system yet. Please contact support if you need an exact count."
     else:
@@ -301,9 +404,18 @@ def chat():
         if top_score - second_score > 0.15:
             best_match = matches[0]['row']
             response = f"I believe you're referring to **{best_match['nombre']}** in {best_match['poblacion']}.<br>"
-            response += f"Center ID: {best_match['id_centro']}<br>"
-            response += f"Code: {best_match['codigo']}<br>"
-            response += f"Location: {best_match['direccion']}"
+            detail_lines = []
+            if id_requested and not code_requested:
+                detail_lines.append(f"Center ID: {best_match['id_centro']}")
+                detail_lines.append(f"Center Code: {best_match['codigo']}")
+            elif code_requested and not id_requested:
+                detail_lines.append(f"Center Code: {best_match['codigo']}")
+                detail_lines.append(f"Center ID: {best_match['id_centro']}")
+            else:
+                detail_lines.append(f"Center ID: {best_match['id_centro']}")
+                detail_lines.append(f"Center Code: {best_match['codigo']}")
+            detail_lines.append(f"Location: {best_match['direccion']}")
+            response += "<br>".join(detail_lines)
             if machine_info_requested:
                 response += "<br>Machine details aren't available in the system yet. Please contact support if you need an exact count."
         else:
@@ -311,7 +423,11 @@ def chat():
             response = "I found multiple centers matching your query. Please specify which one you're referring to:<br><br>"
             for i, match in enumerate(matches, 1):
                 row = match['row']
-                response += f"{i}. **{row['nombre']}** – {row['provincia']} (Code: {row['codigo']})<br>"
+                line = f"{i}. **{row['nombre']}** – {row['provincia']} (Code: {row['codigo']}"
+                if id_requested:
+                    line += f", ID: {row['id_centro']}"
+                line += ")<br>"
+                response += line
 
     return jsonify({"response": response})
 
